@@ -1,0 +1,10 @@
+# Ignorar absolutamente todo en la carpeta
+*
+
+# Permitir carpetas para que Git pueda buscar dentro
+!*/
+
+# ¡Excepción! Permitir tus archivos de Python y configuración
+!*.py
+!*.ipynb
+!.gitignore
