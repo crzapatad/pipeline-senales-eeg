@@ -4,7 +4,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from leer_mat2 import save_lagged_mrl_6s_outputs
+from EEG2.leer_mat3_ import save_lagged_mrl_6s_outputs
 
 
 def load_fs(base_dir):

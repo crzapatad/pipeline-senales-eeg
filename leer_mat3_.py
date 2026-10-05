@@ -2,7 +2,6 @@ import glob
 import math
 import os
 import re
-from itertools import product
 import matplotlib
 matplotlib.use("Agg")
 import h5py
@@ -13,10 +12,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.signal import welch, spectrogram, hilbert, butter, filtfilt, resample_poly, correlate, sosfiltfilt
-from scipy import io as sio
+from scipy.fft import next_fast_len, rfft, irfft
 from scipy.stats import t
 from pathlib import Path
 from joblib import Parallel, delayed
+from itertools import product
+
+ANALYSIS_START_S = 1 * 60
+ANALYSIS_END_S = 6 * 60
+ANALYSIS_INTERVAL_LABEL = "1-6 min"
 
 # ======================================
 # Función auxiliar para determinar dirección del liderazgo
@@ -62,9 +66,6 @@ def clasificar_banda(f):
     else:
         return "Fuera de banda"
 
-'''parse_open_ephys_header(header_text) analiza (o parsea) el texto de un encabezado estructurado, típicamente proveniente de un archivo de datos 
-del sistema Open Ephys, y lo convierte en un diccionario de Python para que sea más fácil trabajar con sus datos.'''
-
 
 def parse_open_ephys_header(header_text):
     header = {}
@@ -81,9 +82,6 @@ def parse_open_ephys_header(header_text):
             value = value[1:-1]
         header[key] = value
     return header
-
-'''Esta función lee y procesa un archivo de datos continuos en formato binario de Open Ephys (típicamente archivos con extensión .continuous), 
-extrayendo los metadatos y convirtiendo la señal eléctrica sin procesar en un vector de NumPy utilizable.'''
 
 
 def read_open_ephys_continuous(path):
@@ -113,10 +111,6 @@ def read_open_ephys_continuous(path):
             raise ValueError(f"No se pudieron leer muestras de {path}")
         data = np.concatenate(data_segments)
         return sample_rate, data, header
-
-
-'''Esta función reduce la tasa de muestreo (subsampling o downsampling) de una señal, convirtiendo los datos 
-grabados a una frecuencia de muestreo original (original_fs) a una menor de destino (target_fs).'''
 
 
 def subsample_open_ephys(data, original_fs, target_fs):
@@ -242,6 +236,27 @@ def detect_data_source(target_fs=None, search_parents=True):
     raise FileNotFoundError("No se encontró un archivo .mat ni la carpeta LFP con archivos .continuous en el árbol de directorios.")
 
 
+def select_analysis_interval(matriz_eeg, fs, start_s=ANALYSIS_START_S, end_s=ANALYSIS_END_S):
+    """Extract the original-recording interval used by every analysis."""
+    total_duration_s = matriz_eeg.shape[0] / float(fs)
+    if start_s < 0 or end_s <= start_s:
+        raise ValueError("El intervalo de analisis debe tener inicio no negativo y fin mayor que inicio.")
+    if end_s > total_duration_s:
+        raise ValueError(
+            f"El intervalo solicitado ({start_s:.1f}-{end_s:.1f} s) excede la duracion "
+            f"del registro ({total_duration_s:.1f} s)."
+        )
+
+    start_idx = int(round(start_s * fs))
+    end_idx = int(round(end_s * fs))
+    segment = matriz_eeg[start_idx:end_idx, :]
+    print(
+        f"Intervalo de analisis seleccionado: {start_s / 60:.0f}-{end_s / 60:.0f} min "
+        f"({start_s:.0f}-{end_s:.0f} s; {segment.shape[0]} muestras)."
+    )
+    return segment
+
+
 def butterworth_bandpass(signal, fs, lowcut, highcut, order=4):
     nyq = 0.5 * fs
     low = max(lowcut / nyq, 1e-6)
@@ -289,53 +304,9 @@ def compute_phase_difference_by_windows(signal_a, signal_b, fs, center_freqs=Non
 
     return window_labels, phase_diff_matrix
 
-# ===============================================================================
-# 7. FUENTE HISTÓRICA PARA CORRELACIÓN CRUZADA
-# ===============================================================================
-def load_cross_correlation_source(target_fs=None):
-    """Carga la matriz residual con etiquetas originales de canal.
-
-    El gráfico histórico canal 17 vs canal 1 se calculaba sobre la matriz
-    residual reducida, no sobre ``allChan_clean`` directamente.
-    """
-    original_channel_indices = [idx for idx in range(32) if idx not in {28, 29}]
-
-    if target_fs is None and os.path.exists("allChan_residual_reduced.npy"):
-        matriz_eeg = np.load("allChan_residual_reduced.npy")
-        Fs = 1000.0
-        print("Usando matriz residual reducida histórica para correlación cruzada.")
-        return matriz_eeg, Fs, {idx + 1: col for col, idx in enumerate(original_channel_indices)}
-
-    matriz_eeg, Fs, _ = detect_data_source(target_fs=target_fs)
-    regiones = {
-        "CPF": range(0, 10),
-        "Nacc": range(10, 16),
-        "Amy": range(16, 25),
-        "Hyp": range(25, 32),
-    }
-    exclude_set = {28, 29}
-    region_avgs = {}
-    for nombre, canales in regiones.items():
-        canales_validos = [ch for ch in canales if ch not in exclude_set and ch < matriz_eeg.shape[1]]
-        region_avgs[nombre] = (
-            np.mean(matriz_eeg[:, canales_validos], axis=1)
-            if canales_validos else np.zeros(matriz_eeg.shape[0])
-        )
-
-    residual = np.zeros_like(matriz_eeg)
-    for ch in range(matriz_eeg.shape[1]):
-        region = next((nombre for nombre, canales in regiones.items() if ch in canales), None)
-        residual[:, ch] = matriz_eeg[:, ch] - region_avgs[region] if region else matriz_eeg[:, ch]
-
-    valid_channels = [ch for ch in range(matriz_eeg.shape[1]) if ch not in exclude_set]
-    residual = residual[:, valid_channels]
-    original_channel_indices = [ch for ch in range(matriz_eeg.shape[1]) if ch not in exclude_set]
-    return residual, Fs, {idx + 1: col for col, idx in enumerate(original_channel_indices)}
-
-
-# ===============================================================================
-# 8. PUNTO DE ENTRADA (INDISPENSABLE PARA MULTIPROCESSING EN WINDOWS)
-# ===============================================================================
+# ==============================================================================
+# 1. FUNCIÓN PARA PROCESAR UN SOLO PAR DE CANALES (PARALELIZABLE)
+# ==============================================================================
 def calcular_mrl_par_individual(par, fases_matriz, lags):
     """
     Calcula el Mean Resultant Length (MRL) rezagado para un único par de canales.
@@ -666,25 +637,28 @@ def compute_lagged_envelope_correlation_by_window(signal_a, signal_b, fs, center
         envolvente_a = np.abs(hilbert(filtered_a))
         envolvente_b = np.abs(hilbert(filtered_b))
 
-        envolvente_a = normalizar_senal(envolvente_a)
-        envolvente_b = normalizar_senal(envolvente_b)
-        window_size = min(len(envolvente_a), len(envolvente_b), 100000)
-        envolvente_a = envolvente_a[:window_size]
-        envolvente_b = envolvente_b[:window_size]
+        for lag_ms in lags_ms:
+            lag_samples = int(round(lag_ms / 1000.0 * fs))
+            if lag_samples > 0:
+                a_aligned = envolvente_a[lag_samples:]
+                b_aligned = envolvente_b[:-lag_samples]
+            elif lag_samples < 0:
+                lag_abs = -lag_samples
+                a_aligned = envolvente_a[:-lag_abs]
+                b_aligned = envolvente_b[lag_abs:]
+            else:
+                a_aligned = envolvente_a
+                b_aligned = envolvente_b
 
-        corr_full = correlate(envolvente_a, envolvente_b, mode="same", method="auto")
-        center_idx = len(corr_full) // 2
-        lag_samples = np.rint(lags_ms / 1000.0 * fs).astype(int)
-        start_idx = center_idx - int(np.max(np.abs(lag_samples)))
-        end_idx = center_idx + int(np.max(np.abs(lag_samples))) + 1
-        corr_limited = corr_full[start_idx:end_idx]
-        normalization = window_size - np.abs(lag_samples)
-        normalization[normalization == 0] = 1
-        corr_values = corr_limited / normalization
-        corr_values = np.nan_to_num(corr_values, nan=0.0, posinf=0.0, neginf=0.0)
+            if len(a_aligned) < 2 or len(b_aligned) < 2:
+                continue
 
-        for lag_ms, correlacion in zip(lags_ms, corr_values):
-            rows.append({"Ventana": label, "Lag_ms": float(lag_ms), "Correlacion_Envolvente": float(correlacion)})
+            if np.std(a_aligned) == 0 or np.std(b_aligned) == 0:
+                correlacion = np.nan
+            else:
+                correlacion = float(np.corrcoef(a_aligned, b_aligned)[0, 1])
+
+            rows.append({"Ventana": label, "Lag_ms": float(lag_ms), "Correlacion_Envolvente": correlacion})
 
     return pd.DataFrame(rows)
 
@@ -694,8 +668,9 @@ def plot_lagged_envelope_summaries(df_lagged, window_name):
     y los máximos por frecuencia/tiempo, análogo a plot_lagged_mrl_summaries pero para envolvente."""
     matrix_lagged = df_lagged.pivot(index="Ventana", columns="Lag_ms", values="Correlacion_Envolvente")
 
+    band_labels = matrix_lagged.index.to_numpy()
     freq_values = []
-    for label in matrix_lagged.index:
+    for label in band_labels:
         match = re.search(r"(\d+)Hz\(", label)
         if match is None:
             raise ValueError(f"No se pudo extraer la frecuencia desde la etiqueta: {label}")
@@ -704,6 +679,7 @@ def plot_lagged_envelope_summaries(df_lagged, window_name):
 
     order = np.argsort(freq_values)
     freq_values_sorted = freq_values[order]
+    band_labels_sorted = band_labels[order]
     matrix_lagged_sorted = matrix_lagged.iloc[order, :].copy()
 
     lag_values = np.asarray(matrix_lagged_sorted.columns, dtype=float)
@@ -720,9 +696,9 @@ def plot_lagged_envelope_summaries(df_lagged, window_name):
     plt.colorbar(label="Correlación de envolvente (r)")
     tick_step = max(1, len(lag_values) // 10)
     plt.xticks(np.arange(0, len(lag_values), tick_step), [f"{x:.0f}" for x in lag_values[::tick_step]])
-    plt.yticks(np.arange(len(freq_values_sorted)), [f"{int(x)}Hz" for x in freq_values_sorted])
+    plt.yticks(np.arange(len(band_labels_sorted)), band_labels_sorted, fontsize=8)
     plt.xlabel("Desfase (ms)")
-    plt.ylabel("Frecuencia (Hz)")
+    plt.ylabel("Banda de frecuencia")
     plt.title(f"Correlación de envolvente por desfase temporal - ventana {window_name}")
     plt.tight_layout()
     plt.savefig(f"envelope_lagged_{window_name}_heatmap.png", dpi=300, bbox_inches="tight")
@@ -746,6 +722,7 @@ def plot_lagged_envelope_summaries(df_lagged, window_name):
     row_max_lags = lag_values[row_max_idx]
     df_freq_max = pd.DataFrame({
         "Frecuencia_Hz": freq_values_sorted,
+        "Ventana_Frecuencia": band_labels_sorted,
         "Lag_ms_Max_Correlacion": row_max_lags,
         "Correlacion_Maxima": row_max_vals,
     })
@@ -1800,6 +1777,10 @@ def save_lagged_mrl_5min_three_random_comparison(
             "El periodo disponible es menor que 5 minutos."
         )
 
+    if pool_end_s - pool_start_s == ventana_s:
+        print("Se omite la comparacion aleatoria: solo esta disponible el intervalo de analisis de 5 minutos.")
+        return None
+
     if real_start_s < pool_start_s or real_end_s > pool_end_s:
         raise ValueError(
             "La ventana real debe estar dentro del periodo disponible."
@@ -2689,6 +2670,7 @@ def main():
     if target_fs is not None and target_fs < Fs:
         matriz_eeg, Fs = filter_and_downsample_matrix(matriz_eeg, Fs, target_fs, order=2, f1=0.1, f2=150.0)
 
+    matriz_eeg = select_analysis_interval(matriz_eeg, Fs)
     n_muestras = matriz_eeg.shape[0]
     n_canales = matriz_eeg.shape[1]
 
@@ -2924,10 +2906,7 @@ def main():
     print("Archivos individuales por ventana guardados con prefijo: phase_difference_window_...")
     print("Figura guardada como: phase_difference_matrix_heatmap.png")
 
-    window_specs = [
-        ("1_6min", 60.0, 360.0),
-        ("11_16min", 660.0, 960.0),
-    ]
+    window_specs = [("1_6min", 0.0, ANALYSIS_END_S - ANALYSIS_START_S)]
 
     # ============================================================
     # 11-16 MIN VS 3 PERIODOS ALEATORIOS
@@ -2937,9 +2916,9 @@ def main():
         señal_canal_1,
         señal_canal_17,
         Fs,
-        window_name="11_16min",
-        real_start_s=660.0,
-        real_end_s=960.0,
+        window_name="1_6min",
+        real_start_s=0.0,
+        real_end_s=ANALYSIS_END_S - ANALYSIS_START_S,
         pool_start_s=0.0,
         pool_end_s=len(señal_canal_1) / Fs,
         center_freqs=np.arange(1, 30, dtype=float),
@@ -2986,6 +2965,7 @@ def main():
         plot_lagged_envelope_summaries(df_lagged_envolvente, window_name)
 
         print(f"Resultados de correlación de envolvente por desfase guardados para {window_name}: envelope_lagged_{window_name}.csv")
+        print(f"Bandas usadas en las envolventes ({window_name}): {', '.join(window_labels)}")
 
         save_lagged_mrl_6s_outputs(
             señal_canal_1,
@@ -3090,11 +3070,14 @@ def main():
         df_segmento = df_phase.iloc[inicio:fin].copy()
         df_segmento.to_csv(nombre_archivo, index=False, encoding="utf-8-sig")
 
-    guardar_segmento_csv("allChan_phase_instantanea_1_6min.csv", 60, 360)
-    guardar_segmento_csv("allChan_phase_instantanea_11_16min.csv", 660, 960)
+    guardar_segmento_csv(
+        "allChan_phase_instantanea_1_6min.csv",
+        0,
+        ANALYSIS_END_S - ANALYSIS_START_S,
+    )
 
     print("Guardados: allChan_phase_instantanea.npy, allChan_phase_instantanea.mat, allChan_phase_instantanea.csv")
-    print("Guardados: allChan_phase_instantanea_1_6min.csv, allChan_phase_instantanea_11_16min.csv")
+    print("Guardado: allChan_phase_instantanea_1_6min.csv")
 
     n_plot_channels = min(6, n_canales)
     muestras_phase = int(min(2 * Fs, n_muestras))
@@ -3423,33 +3406,198 @@ def main():
 
     print("Guardado: allChan_activity.png")
 
-    respuesta = input("¿Ejecutar correlación cruzada combinatoria CPF vs Amígdala? (s/n): ").strip().lower()
-    if respuesta == "s":
-        correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col)
-
 
 # ==============================================================================
-# 4. CORRELACIÓN CRUZADA COMBINATORIA CPF vs AMÍGDALA
+# 5. FUNCIONES DE CORRELACIÓN CRUZADA COMBINATORIA CPF vs AMÍGDALA
 # ==============================================================================
+
+def leer_combinaciones_excel(excel_path=None):
+    """Lee el registro de combinaciones desde CSV o Excel.
+
+    Acepta el CSV del usuario `EjemploCombinacion_CPF_vs_Amigdala_Todas.csv`
+    y el Excel del ejemplo anterior, devolviendo la lista
+    `(canal_a, canal_b, low_a, high_a, low_b, high_b)`
+    para que el flujo de correlación cruzada aplique el filtrado por canal
+    en cada criterio de banda exacto, como se hizo con la primera serie de
+    seis combinaciones del ejemplo del día anterior.
+    """
+    candidates = []
+    if excel_path:
+        candidates.append(excel_path)
+
+    candidates.extend([
+        os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas.csv"),
+        os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas (1).xlsx"),
+        os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas.xlsx"),
+        os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas (1).xls"),
+        os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas.xls"),
+    ])
+
+    workbook = None
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            workbook = candidate
+            break
+
+    if workbook is None:
+        return None
+
+    # Primero: CSV de columnas explícitas del usuario.
+    if workbook.endswith(".csv"):
+        try:
+            df = pd.read_csv(workbook)
+            if df is None or df.empty:
+                return None
+            combos = []
+            # Normales para el ejemplo del CSV.
+            for _, row in df.iterrows():
+                canales = str(row.get("Canales", "") or "")
+                match = re.search(r"(\d+)\s*[-–]\s*(\d+)", canales)
+                if not match:
+                    continue
+                canal_a = int(match.group(1))
+                canal_b = int(match.group(2))
+                band_a = str(row.get("Banda Canal 1", "") or "")
+                band_b = str(row.get("Banda Canal 2", "") or "")
+                m1 = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*[-–]\s*([0-9]+(?:[.,][0-9]+)?)", band_a)
+                m2 = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*[-–]\s*([0-9]+(?:[.,][0-9]+)?)", band_b)
+                if not m1 or not m2:
+                    continue
+                low_a = float(m1.group(1).replace(",", "."))
+                high_a = float(m1.group(2).replace(",", "."))
+                low_b = float(m2.group(1).replace(",", "."))
+                high_b = float(m2.group(2).replace(",", "."))
+                combos.append((canal_a, canal_b, low_a, high_a, low_b, high_b))
+            return combos if combos else None
+        except Exception:
+            return None
+
+    # Segundo: hojas Excel de ejemplo.
+    try:
+        df = pd.read_excel(workbook, sheet_name=0)
+    except Exception:
+        try:
+            workbook_sheets = pd.read_excel(workbook, sheet_name=None)
+            if isinstance(workbook_sheets, dict):
+                df = next(iter(workbook_sheets.values()))
+            else:
+                df = workbook_sheets
+        except Exception:
+            return None
+
+    if df is None or df.empty:
+        return None
+
+    # Detectar escudos de nombres de columna.
+    def normalizar(col):
+        return re.sub(r"[^a-z0-9]+", "", str(col).lower())
+
+    keys = {normalizar(col): col for col in list(df.columns)}
+
+    # Intentar identificar columnas de canal y de banda.
+    col_cpf = None
+    col_amy = None
+    col_cpf_banda = None
+    col_amy_banda = None
+
+    for key, col in keys.items():
+        if "cpf" in key and ("canal" in key or "channel" in key):
+            col_cpf = col
+        elif "amy" in key and ("canal" in key or "channel" in key):
+            col_amy = col
+        elif "cpf" in key and ("banda" in key or "band" in key or "freq" in key or "hz" in key):
+            col_cpf_banda = col
+        elif "amy" in key and ("banda" in key or "band" in key or "freq" in key or "hz" in key):
+            col_amy_banda = col
+
+    # Fallback: si el libro viene con nombres más simples de cada panel, lo tomamos igual.
+    combos = []
+    for _, row in df.iterrows():
+        # canal CPF
+        cpf_val = row[col_cpf] if col_cpf else None
+        amy_val = row[col_amy] if col_amy else None
+
+        try:
+            canal_cpf = int(float(cpf_val))
+        except Exception:
+            match = re.search(r"\b(\d+)\b", str(cpf_val or ""))
+            canal_cpf = int(match.group(1)) if match else None
+
+        try:
+            canal_amy = int(float(amy_val))
+        except Exception:
+            match = re.search(r"\b(\d+)\b", str(amy_val or ""))
+            canal_amy = int(match.group(1)) if match else None
+
+        # Banda por canal
+        low_cpf, high_cpf = None, None
+        low_amy, high_amy = None, None
+
+        # 1) columnas de banda explícitas, si existen
+        if col_cpf_banda and col_amy_banda:
+            for col_val, target in [(row[col_cpf_banda], 'cpf'), (row[col_amy_banda], 'amy')]:
+                text = str(col_val or "")
+                match = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*[-–]\s*([0-9]+(?:[.,][0-9]+)?)\s*Hz", text)
+                if match:
+                    if target == 'cpf':
+                        low_cpf = float(match.group(1).replace(",", "."))
+                        high_cpf = float(match.group(2).replace(",", "."))
+                    else:
+                        low_amy = float(match.group(1).replace(",", "."))
+                        high_amy = float(match.group(2).replace(",", "."))
+
+        # 2) fallback por columnas de texto sueltas o por rangos al estilo 1.5-3.5
+        if low_cpf is None or high_cpf is None or low_amy is None or high_amy is None:
+            for key in row.keys():
+                text = str(row[key] or "")
+                if not text:
+                    continue
+                m = re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*[-–]\s*([0-9]+(?:[.,][0-9]+)?)\s*Hz", text)
+                if len(m) >= 2:
+                    first = tuple(float(x.replace(",", ".")) for x in m[0])
+                    second = tuple(float(x.replace(",", ".")) for x in m[1])
+                    low_cpf, high_cpf = first
+                    low_amy, high_amy = second
+                    break
+
+        if canal_cpf is None or canal_amy is None:
+            continue
+        if low_cpf is None or high_cpf is None or low_amy is None or high_amy is None:
+            continue
+
+        # Ordena la fila solo si los canales pertenecen al dominio del estudio.
+        if int(canal_cpf) < 1 or int(canal_cpf) > 10:
+            continue
+        if int(canal_amy) < 17 or int(canal_amy) > 25:
+            continue
+
+        combos.append((int(canal_cpf), int(canal_amy), float(low_cpf), float(high_cpf), float(low_amy), float(high_amy)))
+
+    return combos if combos else None
+
+
 def normalizar_senal(signal):
     """Normaliza la señal a media 0 y desviación típica 1, eliminando NaN/Inf."""
     signal = np.asarray(signal, dtype=np.float64)
-    media = np.mean(signal)
-    desviacion = np.std(signal)
-    if desviacion < 1e-12:
-        signal_norm = np.zeros_like(signal, dtype=np.float64)
-    else:
-        signal_norm = (signal - media) / (desviacion + 1e-10)
-    return np.nan_to_num(signal_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    signal = signal - np.mean(signal)
+    signal = signal / (np.std(signal) + 1e-12)
+    return np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def calcular_correlacion_cruzada(senal1, senal2, fs, max_lag_ms=250,
-                                 filtro=(0.1, 30.0), orden=4, window_size=100000):
-    """Calcula la correlación cruzada histórica de dos señales.
+                                 filtro=(0.5, 30.0), orden=4, window_size=None,
+                                 filtro_1=None, filtro_2=None):
+    """Calcula la sincronía de amplitud entre dos señales EEG mediante:
 
-    La señal se filtra antes de normalizarla y se limita a las primeras 100000 muestras,
-    se correlaciona con ``mode='same'`` y se divide por el solapamiento de cada
-    lag. Se conserva la banda histórica de 0.1-30 Hz.
+    1) filtrado por banda,
+    2) normalización,
+    3) Hilbert para obtener la envolvente,
+    4) correlación cruzada de ambas envolventes.
+
+    Devuelve los lags en ms y la serie de correlación.
+
+    Se admite también el caso de bandas separadas por canal:
+    `filtro_1` se aplica a la señal 1, `filtro_2` a la señal 2.
     """
     senal1 = np.asarray(senal1, dtype=np.float64)
     senal2 = np.asarray(senal2, dtype=np.float64)
@@ -3457,149 +3605,435 @@ def calcular_correlacion_cruzada(senal1, senal2, fs, max_lag_ms=250,
     if len(senal1) == 0 or len(senal2) == 0:
         raise ValueError("Las señales no pueden estar vacías")
 
-    if filtro is not None:
+    # Filtrado por canal separado si llega una pareja de bandas desde el Excel.
+    if filtro_1 is not None:
+        senal1 = butterworth_bandpass(senal1, fs, float(filtro_1[0]), float(filtro_1[1]), order=orden)
+    elif filtro is not None:
         senal1 = butterworth_bandpass(senal1, fs, float(filtro[0]), float(filtro[1]), order=orden)
+
+    if filtro_2 is not None:
+        senal2 = butterworth_bandpass(senal2, fs, float(filtro_2[0]), float(filtro_2[1]), order=orden)
+    elif filtro is not None:
         senal2 = butterworth_bandpass(senal2, fs, float(filtro[0]), float(filtro[1]), order=orden)
 
     min_len = min(len(senal1), len(senal2))
-    window_size = min(min_len, 100000 if window_size is None else int(window_size))
+    if window_size is None:
+        window_size = min(min_len, 50000)
+    else:
+        window_size = min(int(window_size), min_len)
 
-    senal1 = normalizar_senal(senal1[:min_len])
-    senal2 = normalizar_senal(senal2[:min_len])
-    senal1_win = senal1[:window_size]
-    senal2_win = senal2[:window_size]
+    senal1_win = normalizar_senal(senal1[:window_size])
+    senal2_win = normalizar_senal(senal2[:window_size])
 
-    max_lag_samples = int(max_lag_ms / 1000.0 * fs)
-    lags_samples = np.arange(-max_lag_samples, max_lag_samples + 1, dtype=int)
+    envolvente1 = np.abs(hilbert(senal1_win))
+    envolvente2 = np.abs(hilbert(senal2_win))
+
+    envolvente1 = normalizar_senal(envolvente1)
+    envolvente2 = normalizar_senal(envolvente2)
+
+    max_lag_samples = max(1, int(round(max_lag_ms / 1000.0 * fs)))
+    cross_corr = correlate(envolvente1, envolvente2, mode="full", method="fft")
+
+    lags_samples = np.arange(-len(envolvente2) + 1, len(envolvente1))
+    valid = (lags_samples >= -max_lag_samples) & (lags_samples <= max_lag_samples)
+    lags_samples = lags_samples[valid]
+    cross_corr_limited = cross_corr[valid]
+
+    if len(cross_corr_limited) == 0:
+        raise ValueError("El rango de lags solicitado queda vacío")
+
     lags_ms = lags_samples / fs * 1000.0
+    overlap = len(envolvente1) - np.abs(lags_samples)
+    overlap = np.maximum(overlap, 1)
+    cross_corr_normalized = cross_corr_limited / overlap
+    cross_corr_normalized = np.clip(
+        np.nan_to_num(cross_corr_normalized, nan=0.0, posinf=0.0, neginf=0.0),
+        -1.0,
+        1.0,
+    )
 
-    corr_full = correlate(senal1_win, senal2_win, mode="same", method="auto")
-    center_idx = len(corr_full) // 2
-    start_idx = center_idx - max_lag_samples
-    end_idx = center_idx + max_lag_samples + 1
-    corr_values = corr_full[start_idx:end_idx]
-    normalization = window_size - np.abs(lags_samples)
-    normalization[normalization == 0] = 1
-    corr_values = corr_values / normalization
-    corr_values = np.nan_to_num(corr_values, nan=0.0, posinf=0.0, neginf=0.0)
+    max_idx = int(np.argmax(cross_corr_normalized))
+    min_idx = int(np.argmin(cross_corr_normalized))
 
-    max_idx = int(np.argmax(corr_values))
-    min_idx = int(np.argmin(corr_values))
+    return {
+        'lags_ms': lags_ms,
+        'cross_corr': cross_corr_normalized,
+        'max_corr': float(cross_corr_normalized[max_idx]),
+        'max_lag': float(lags_ms[max_idx]),
+        'min_corr': float(cross_corr_normalized[min_idx]),
+        'min_lag': float(lags_ms[min_idx]),
+    }
+
+
+def correlacion_cruzada_canal_1_17_primera_combinacion(
+    matriz_eeg,
+    Fs,
+    original_to_col,
+    max_lag_ms=250,
+    orden=4,
+    output_csv="correlacion_cruzada_canal_1_17_primera_combinacion.csv",
+    output_plot="correlacion_cruzada_canal_1_17_primera_combinacion_plot.png",
+):
+    """Primera combinación de canales: canal 1 y canal 17.
+
+    Antes de la correlación cruzada, cada señal recibe su propio filtro de
+    banda en la fase de procesamiento:
+        - Canal 1: 1.5 Hz a 3.5 Hz
+        - Canal 17: 1.6 Hz a 3.6 Hz
+
+    Después se normaliza la señal filtrada, se toma la envolvente de Hilbert
+    para cada canal y se calcula la correlación cruzada de envolventes con
+    lag temporal en ms.
+    """
+    if 1 not in original_to_col:
+        raise ValueError("El canal 1 no está presente en original_to_col.")
+    if 17 not in original_to_col:
+        raise ValueError("El canal 17 no está presente en original_to_col.")
+
+    col_canal_1 = original_to_col[1]
+    col_canal_17 = original_to_col[17]
+
+    senal_1 = np.asarray(matriz_eeg[:, col_canal_1], dtype=np.float64)
+    senal_17 = np.asarray(matriz_eeg[:, col_canal_17], dtype=np.float64)
+
+    min_len = min(len(senal_1), len(senal_17))
+    senal_1 = senal_1[:min_len]
+    senal_17 = senal_17[:min_len]
+
+    # Fase de filtrado: bandas propias de cada canal.
+    senal_1_filtrada = butterworth_bandpass(senal_1, Fs, 1.5, 3.5, order=orden)
+    senal_17_filtrada = butterworth_bandpass(senal_17, Fs, 1.6, 3.6, order=orden)
+
+    # Normalización z-score y limpieza inicial.
+    senal_1_norm = normalizar_senal(senal_1_filtrada)
+    senal_17_norm = normalizar_senal(senal_17_filtrada)
+
+    # Envolvente de amplitud con Hilbert.
+    envolvente_1 = np.abs(hilbert(senal_1_norm))
+    envolvente_17 = np.abs(hilbert(senal_17_norm))
+
+    # Normalizar las envolventes para comparar la serie de correlación.
+    envolvente_1 = normalizar_senal(envolvente_1)
+    envolvente_17 = normalizar_senal(envolvente_17)
+
+    # Cross-correlation en lag usando el mismo patrón ya en el archivo.
+    max_lag_samples = max(1, int(round(max_lag_ms / 1000.0 * Fs)))
+    cross_corr = correlate(envolvente_1, envolvente_17, mode="full", method="fft")
+
+    lags_samples = np.arange(-len(envolvente_17) + 1, len(envolvente_1))
+    valid = (lags_samples >= -max_lag_samples) & (lags_samples <= max_lag_samples)
+    lags_samples = lags_samples[valid]
+    cross_corr_limited = cross_corr[valid]
+
+    if len(cross_corr_limited) == 0:
+        raise ValueError("El rango de lags solicitado queda vacío")
+
+    lags_ms = lags_samples / Fs * 1000.0
+    overlap = len(envolvente_1) - np.abs(lags_samples)
+    overlap = np.maximum(overlap, 1)
+
+    cross_corr_normalized = cross_corr_limited / overlap
+    cross_corr_normalized = np.clip(
+        np.nan_to_num(cross_corr_normalized, nan=0.0, posinf=0.0, neginf=0.0),
+        -1.0,
+        1.0,
+    )
+
+    max_idx = int(np.argmax(cross_corr_normalized))
+    min_idx = int(np.argmin(cross_corr_normalized))
+
+    df_resultados = pd.DataFrame({
+        "lag_ms": lags_ms,
+        "cross_correlation_envelope": cross_corr_normalized,
+    })
+    df_resultados.to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+    # Gráfico de la correlación cruzada de envolventes en lag ms.
+    plt.figure(figsize=(10, 5))
+    plt.plot(lags_ms, cross_corr_normalized, color="tab:blue", linewidth=1.2)
+    plt.axvline(0, color="gray", linestyle="--", linewidth=0.8)
+    plt.scatter([lags_ms[max_idx]], [cross_corr_normalized[max_idx]], color="red", zorder=3)
+    plt.scatter([lags_ms[min_idx]], [cross_corr_normalized[min_idx]], color="darkgreen", zorder=3)
+
+    peak_lag = float(lags_ms[max_idx])
+    peak_corr = float(cross_corr_normalized[max_idx])
+    peak_label = f"Peak: ({peak_lag:.2f} ms, {peak_corr:.4f})"
+    plt.scatter([peak_lag], [peak_corr], color="red", zorder=3, label=peak_label)
+    plt.legend(loc="upper right", frameon=True, fontsize=9)
+
+    # Determinar y mostrar dirección del liderazgo
+    direccion_texto = determinar_direccion_liderazgo(peak_lag, "Canal 1 (PFC)", "Canal 17 (Amy)")
+    plt.text(0.02, 0.98, direccion_texto,
+            transform=plt.gca().transAxes,
+            fontsize=10,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+            fontweight='bold')
+
+    plt.xlabel("Lag (ms)")
+    plt.ylabel("Cross-correlation de envolventes")
+    plt.title("Canal 1 vs Canal 17 (1.5-3.5 Hz vs 1.6-3.6 Hz)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_plot, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print("=" * 80)
+    print("CORRELACIÓN CRUZADA CANAL 1 vs CANAL 17")
+    print("Banda Canal 1: 1.5-3.5 Hz")
+    print("Banda Canal 17: 1.6-3.6 Hz")
+    print(f"Frecuencia de muestreo consultada: {Fs} Hz")
+    print(f"Lag máximo: ±{max_lag_ms} ms")
+    print(f"Máxima correlación: {cross_corr_normalized[max_idx]:.6f} @ lag {lags_ms[max_idx]:.2f} ms")
+    print(f"Mínima correlación: {cross_corr_normalized[min_idx]:.6f} @ lag {lags_ms[min_idx]:.2f} ms")
+    print(f"Gráfico guardado en: {output_plot}")
+    print(f"CSV guardado en: {output_csv}")
+    print("=" * 80)
 
     return {
         "lags_ms": lags_ms,
-        "cross_corr": corr_values,
-        "max_corr": float(corr_values[max_idx]),
+        "cross_corr": cross_corr_normalized,
+        "max_corr": float(cross_corr_normalized[max_idx]),
         "max_lag": float(lags_ms[max_idx]),
-        "min_corr": float(corr_values[min_idx]),
+        "min_corr": float(cross_corr_normalized[min_idx]),
         "min_lag": float(lags_ms[min_idx]),
+        "csv": output_csv,
+        "plot": output_plot,
     }
 
 
-def _escala_simetrica(valores):
-    limite = float(np.nanmax(np.abs(valores)))
-    if not np.isfinite(limite) or limite == 0:
-        limite = 1.0
-    return -limite, limite
+def correlacion_cruzada_canal_1_17_segunda_combinacion(
+    matriz_eeg,
+    Fs,
+    original_to_col,
+    max_lag_ms=250,
+    orden=4,
+    output_csv="correlacion_cruzada_canal_1_17_segunda_combinacion.csv",
+    output_plot="correlacion_cruzada_canal_1_17_segunda_combinacion_plot.png",
+):
+    """Segunda combinación de canales: canal 1 y canal 17.
 
+    Fase de filtrado por canal:
+        - Canal 1: 1.5 Hz a 3.5 Hz
+        - Canal 17: 7.2 Hz a 9.2 Hz
 
-def correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col,
-                                             canales_cpf=None, canales_amy=None,
-                                             max_lag_ms=250):
-    """Correlación cruzada de todos los pares CPF (1-10) vs Amígdala (17-25)."""
+    Después se normaliza la señal filtrada, se toma la envolvente de Hilbert
+    para cada canal y se calcula la correlación cruzada de envolventes en lag ms.
+    """
+    if 1 not in original_to_col:
+        raise ValueError("El canal 1 no está presente en original_to_col.")
+    if 17 not in original_to_col:
+        raise ValueError("El canal 17 no está presente en original_to_col.")
+
+    col_canal_1 = original_to_col[1]
+    col_canal_17 = original_to_col[17]
+
+    senal_1 = np.asarray(matriz_eeg[:, col_canal_1], dtype=np.float64)
+    senal_17 = np.asarray(matriz_eeg[:, col_canal_17], dtype=np.float64)
+
+    min_len = min(len(senal_1), len(senal_17))
+    senal_1 = senal_1[:min_len]
+    senal_17 = senal_17[:min_len]
+
+    # Fase de filtrado: bandas propias de cada canal.
+    senal_1_filtrada = butterworth_bandpass(senal_1, Fs, 1.5, 3.5, order=orden)
+    senal_17_filtrada = butterworth_bandpass(senal_17, Fs, 7.2, 9.2, order=orden)
+
+    # Normalización z-score y limpieza inicial.
+    senal_1_norm = normalizar_senal(senal_1_filtrada)
+    senal_17_norm = normalizar_senal(senal_17_filtrada)
+
+    # Envolvente de amplitud con Hilbert.
+    envolvente_1 = np.abs(hilbert(senal_1_norm))
+    envolvente_17 = np.abs(hilbert(senal_17_norm))
+
+    # Normalizar las envolventes.
+    envolvente_1 = normalizar_senal(envolvente_1)
+    envolvente_17 = normalizar_senal(envolvente_17)
+
+    # Cross-correlation en lag usando el mismo patrón ya en el archivo.
+    max_lag_samples = max(1, int(round(max_lag_ms / 1000.0 * Fs)))
+    cross_corr = correlate(envolvente_1, envolvente_17, mode="full", method="fft")
+
+    lags_samples = np.arange(-len(envolvente_17) + 1, len(envolvente_1))
+    valid = (lags_samples >= -max_lag_samples) & (lags_samples <= max_lag_samples)
+    lags_samples = lags_samples[valid]
+    cross_corr_limited = cross_corr[valid]
+
+    if len(cross_corr_limited) == 0:
+        raise ValueError("El rango de lags solicitado queda vacío")
+
+    lags_ms = lags_samples / Fs * 1000.0
+    overlap = len(envolvente_1) - np.abs(lags_samples)
+    overlap = np.maximum(overlap, 1)
+
+    cross_corr_normalized = cross_corr_limited / overlap
+    cross_corr_normalized = np.clip(
+        np.nan_to_num(cross_corr_normalized, nan=0.0, posinf=0.0, neginf=0.0),
+        -1.0,
+        1.0,
+    )
+
+    max_idx = int(np.argmax(cross_corr_normalized))
+    min_idx = int(np.argmin(cross_corr_normalized))
+
+    df_resultados = pd.DataFrame({
+        "lag_ms": lags_ms,
+        "cross_correlation_envelope": cross_corr_normalized,
+    })
+    df_resultados.to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(lags_ms, cross_corr_normalized, color="tab:blue", linewidth=1.2)
+    plt.axvline(0, color="gray", linestyle="--", linewidth=0.8)
+    plt.scatter([lags_ms[max_idx]], [cross_corr_normalized[max_idx]], color="red", zorder=3)
+    plt.scatter([lags_ms[min_idx]], [cross_corr_normalized[min_idx]], color="darkgreen", zorder=3)
+
+    peak_lag = float(lags_ms[max_idx])
+    peak_corr = float(cross_corr_normalized[max_idx])
+    peak_label = f"Peak: ({peak_lag:.2f} ms, {peak_corr:.4f})"
+    plt.scatter([peak_lag], [peak_corr], color="red", zorder=3, label=peak_label)
+    plt.legend(loc="upper right", frameon=True, fontsize=9)
+
+    # Determinar y mostrar dirección del liderazgo
+    direccion_texto = determinar_direccion_liderazgo(peak_lag, "Canal 1 (PFC)", "Canal 17 (Amy)")
+    plt.text(0.02, 0.98, direccion_texto,
+            transform=plt.gca().transAxes,
+            fontsize=10,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+            fontweight='bold')
+
+    plt.xlabel("Lag (ms)")
+    plt.ylabel("Cross-correlation de envolventes")
+    plt.title("Canal 1 vs Canal 17 (1.5-3.5 Hz vs 7.2-9.2 Hz)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_plot, dpi=300, bbox_inches="tight")
+    plt.close()
+
     print("=" * 80)
-    print("CORRELACIÓN CRUZADA COMBINATORIA: CPF vs AMÍGDALA")
+    print("CORRELACIÓN CRUZADA CANAL 1 vs CANAL 17")
+    print("Banda Canal 1: 1.5-3.5 Hz")
+    print("Banda Canal 17: 7.2-9.2 Hz")
+    print(f"Frecuencia de muestreo consultada: {Fs} Hz")
+    print(f"Lag máximo: ±{max_lag_ms} ms")
+    print(f"Máxima correlación: {cross_corr_normalized[max_idx]:.6f} @ lag {lags_ms[max_idx]:.2f} ms")
+    print(f"Mínima correlación: {cross_corr_normalized[min_idx]:.6f} @ lag {lags_ms[min_idx]:.2f} ms")
+    print(f"Gráfico guardado en: {output_plot}")
+    print(f"CSV guardado en: {output_csv}")
     print("=" * 80)
 
-    canales_cpf = canales_cpf or list(range(1, 11))
-    canales_amy = canales_amy or list(range(17, 26))
+    return {
+        "lags_ms": lags_ms,
+        "cross_corr": cross_corr_normalized,
+        "max_corr": float(cross_corr_normalized[max_idx]),
+        "max_lag": float(lags_ms[max_idx]),
+        "min_corr": float(cross_corr_normalized[min_idx]),
+        "min_lag": float(lags_ms[min_idx]),
+        "csv": output_csv,
+        "plot": output_plot,
+    }
 
-    faltantes = [c for c in canales_cpf + canales_amy if c not in original_to_col]
-    if faltantes:
-        print(f"ERROR: Los siguientes canales no están disponibles: {faltantes}")
-        return None
 
-    combinaciones = list(product(canales_cpf, canales_amy))
-    print(f"Canales CPF: {canales_cpf}")
-    print(f"Canales Amy: {canales_amy}")
-    print(f"Total combinaciones: {len(combinaciones)}")
-    print()
+def correlacion_cruzada_canal_1_17_seis_combinaciones(
+    matriz_eeg,
+    Fs,
+    original_to_col,
+    max_lag_ms=250,
+    orden=4,
+    output_csv="correlacion_cruzada_canal_1_17_seis_bandas_resumen.csv",
+):
+    """Genera las seis combinaciones de bandas del ejemplo de referencia.
+
+    Se usa el patrón de resumen ya existente en el repositorio:
+    0-2, 4-6, 8-10, 12-14, 16-18, 20-22 Hz, sobre las señales de canal 1 y canal 17.
+    La salida se guarda en un CSV de resumen con columnas:
+        Combinacion, Frecuencia_baja_Hz, Frecuencia_alta_Hz, Banda,
+        max_corr, max_lag_ms, min_corr, min_lag_ms, mean_corr, std_corr
+    """
+    if 1 not in original_to_col:
+        raise ValueError("El canal 1 no está presente en original_to_col.")
+    if 17 not in original_to_col:
+        raise ValueError("El canal 17 no está presente en original_to_col.")
+
+    col_canal_1 = original_to_col[1]
+    col_canal_17 = original_to_col[17]
+
+    senal_1 = np.asarray(matriz_eeg[:, col_canal_1], dtype=np.float64)
+    senal_17 = np.asarray(matriz_eeg[:, col_canal_17], dtype=np.float64)
+
+    min_len = min(len(senal_1), len(senal_17))
+    senal_1 = senal_1[:min_len]
+    senal_17 = senal_17[:min_len]
+
+    # Ajuste exacto a la hoja de ejemplo visible en la captura:
+    # 1 -> canal 1: 1.5-3.5 Hz; canal 17: 1.6-3.6 Hz
+    # 2 -> canal 1: 1.5-3.5 Hz; canal 17: 7.2-9.2 Hz
+    # 3 -> canal 1: 1.5-3.5 Hz; canal 17: 24-42 Hz
+    # 4 -> canal 1: 8.8-10.8 Hz; canal 17: 1.6-3.6 Hz
+    # 5 -> canal 1: 8.8-10.8 Hz; canal 17: 7.2-9.2 Hz
+    # 6 -> canal 1: 8.8-10.8 Hz; canal 17: 24-42 Hz
+    windows = [
+        (1.5, 3.5, 1.6, 3.6),
+        (1.5, 3.5, 7.2, 9.2),
+        (1.5, 3.5, 24.0, 42.0),
+        (8.8, 10.8, 1.6, 3.6),
+        (8.8, 10.8, 7.2, 9.2),
+        (8.8, 10.8, 24.0, 42.0),
+    ]
 
     resultados = []
-    datos_correlacion = {}
+    for idx, (low1, high1, low2, high2) in enumerate(windows, start=1):
+        senal_1_filtrada = butterworth_bandpass(senal_1, Fs, float(low1), float(high1), order=orden)
+        senal_17_filtrada = butterworth_bandpass(senal_17, Fs, float(low2), float(high2), order=orden)
 
-    señales_filtradas_historicas = {}
-    archivos_historicos = {
-        1: "canal_1_PFC_butterworth_0_30_n4.npy",
-        17: "canal_17_Amy_butterworth_0_30_n4.npy",
-    }
-    for canal, archivo in archivos_historicos.items():
-        if os.path.exists(archivo):
-            señal_historica = np.load(archivo)
-            if np.isfinite(señal_historica).all():
-                señales_filtradas_historicas[canal] = señal_historica
+        senal_1_norm = normalizar_senal(senal_1_filtrada)
+        senal_17_norm = normalizar_senal(senal_17_filtrada)
 
-    for i, (canal_cpf, canal_amy) in enumerate(combinaciones, 1):
-        senal_cpf = señales_filtradas_historicas.get(
-            canal_cpf, matriz_eeg[:, original_to_col[canal_cpf]]
+        envolvente_1 = np.abs(hilbert(senal_1_norm))
+        envolvente_17 = np.abs(hilbert(senal_17_norm))
+
+        envolvente_1 = normalizar_senal(envolvente_1)
+        envolvente_17 = normalizar_senal(envolvente_17)
+
+        max_lag_samples = max(1, int(round(max_lag_ms / 1000.0 * Fs)))
+        cross_corr = correlate(envolvente_1, envolvente_17, mode="full", method="fft")
+
+        lags_samples = np.arange(-len(envolvente_17) + 1, len(envolvente_1))
+        valid = (lags_samples >= -max_lag_samples) & (lags_samples <= max_lag_samples)
+        lags_samples = lags_samples[valid]
+        cross_corr_limited = cross_corr[valid]
+
+        lags_ms = lags_samples / Fs * 1000.0
+        overlap = len(envolvente_1) - np.abs(lags_samples)
+        overlap = np.maximum(overlap, 1)
+        cross_corr_normalized = cross_corr_limited / overlap
+        cross_corr_normalized = np.clip(
+            np.nan_to_num(cross_corr_normalized, nan=0.0, posinf=0.0, neginf=0.0),
+            -1.0,
+            1.0,
         )
-        senal_amy = señales_filtradas_historicas.get(
-            canal_amy, matriz_eeg[:, original_to_col[canal_amy]]
-        )
-        min_len = min(len(senal_cpf), len(senal_amy))
 
-        usa_archivos_historicos = canal_cpf in señales_filtradas_historicas and canal_amy in señales_filtradas_historicas
+        max_idx = int(np.argmax(cross_corr_normalized))
+        min_idx = int(np.argmin(cross_corr_normalized))
 
-        resultado = calcular_correlacion_cruzada(
-            senal_cpf[:min_len], senal_amy[:min_len], Fs, max_lag_ms=max_lag_ms,
-            filtro=None if usa_archivos_historicos else (0.1, 30.0),
-            orden=4,
-            window_size=100000,
-        )
+        banda_1 = f"Banda {low1:g}-{high1:g} Hz"
+        banda_2 = f"Banda {low2:g}-{high2:g} Hz"
 
-        resultados.append({
-            "CPF_canal": canal_cpf,
-            "Amy_canal": canal_amy,
-            "max_corr": resultado["max_corr"],
-            "max_lag_ms": resultado["max_lag"],
-            "min_corr": resultado["min_corr"],
-            "min_lag_ms": resultado["min_lag"],
-            "mean_corr": np.mean(resultado["cross_corr"]),
-            "std_corr": np.std(resultado["cross_corr"]),
-        })
-        datos_correlacion[f"CPF_{canal_cpf}_Amy_{canal_amy}"] = resultado
+        peak_lag = float(lags_ms[max_idx])
+        peak_corr = float(cross_corr_normalized[max_idx])
 
-        print(f"[{i}/{len(combinaciones)}] CPF-{canal_cpf} vs Amy-{canal_amy}: "
-              f"máx {resultado['max_corr']:.4f} @ {resultado['max_lag']:.1f}ms | "
-              f"mín {resultado['min_corr']:.4f} @ {resultado['min_lag']:.1f}ms")
-
-    df_resultados = pd.DataFrame(resultados)
-    df_resultados.to_csv("correlacion_cruzada_combinatoria_resumen.csv", index=False)
-    np.save("correlacion_cruzada_combinatoria_datos.npy", datos_correlacion)
-
-    directorio_individual = "correlaciones_individuales"
-    os.makedirs(directorio_individual, exist_ok=True)
-
-    for canal_cpf, canal_amy in combinaciones:
-        data = datos_correlacion[f"CPF_{canal_cpf}_Amy_{canal_amy}"]
-
-        plt.figure(figsize=(12, 5))
-        plt.plot(data["lags_ms"], data["cross_corr"], linewidth=2, color="blue")
-        plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-        plt.axvline(x=0, color="black", linestyle="--", alpha=0.5)
-        plt.axvline(x=data["max_lag"], color="red", linestyle=":", linewidth=2,
-                    label=f'Máx: {data["max_corr"]:.3f} @ {data["max_lag"]:.1f}ms')
-        plt.axvline(x=data["min_lag"], color="green", linestyle=":", linewidth=2,
-                    label=f'Mín: {data["min_corr"]:.3f} @ {data["min_lag"]:.1f}ms')
-        plt.xlabel("Lag (ms)", fontsize=12)
-        plt.ylabel("Correlación Cruzada", fontsize=12)
-        plt.title(f"Correlación Cruzada: CPF-{canal_cpf} vs Amy-{canal_amy}",
-                  fontsize=14, fontweight="bold")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+        plt.figure(figsize=(10, 5))
+        plt.plot(lags_ms, cross_corr_normalized, color="tab:blue", linewidth=1.2)
+        plt.axvline(0, color="gray", linestyle="--", linewidth=0.8)
+        plt.scatter([peak_lag], [peak_corr], color="red", zorder=3)
+        peak_label = f"Peak: ({peak_lag:.2f} ms, {peak_corr:.4f})"
+        plt.scatter([peak_lag], [peak_corr], color="red", zorder=3, label=peak_label)
+        plt.legend(loc="upper right", frameon=True, fontsize=9)
 
         # Determinar y mostrar dirección del liderazgo
-        direccion_texto = determinar_direccion_liderazgo(data["max_lag"], f"CPF-{canal_cpf}", f"Amy-{canal_amy}")
+        direccion_texto = determinar_direccion_liderazgo(peak_lag, "Canal 1 (PFC)", "Canal 17 (Amy)")
         plt.text(0.02, 0.98, direccion_texto,
                 transform=plt.gca().transAxes,
                 fontsize=10,
@@ -3607,368 +4041,656 @@ def correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col,
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
                 fontweight='bold')
 
+        plt.xlabel("Lag (ms)")
+        plt.ylabel("Cross-correlation de envolventes")
+        plt.title(f"Canal 1 vs Canal 17 - Combinacion {idx}: {banda_1} / {banda_2}")
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(f"{directorio_individual}/correlacion_CPF{canal_cpf}_Amy{canal_amy}.png",
-                    dpi=300, bbox_inches="tight")
+        plt.savefig(f"correlacion_cruzada_canal_1_17_combinacion_{idx}.png", dpi=300, bbox_inches="tight")
         plt.close()
 
-        pd.DataFrame({
-            "lag_ms": data["lags_ms"],
-            "cross_correlation": data["cross_corr"],
-        }).to_csv(f"{directorio_individual}/correlacion_CPF{canal_cpf}_Amy{canal_amy}.csv",
-                  index=False)
+        resultados.append({
+            "Combinacion": idx,
+            "Frecuencia_baja_Hz": float(low1),
+            "Frecuencia_alta_Hz": float(high1),
+            "Banda": banda_1,
+            "Canal_1_Banda": banda_1,
+            "Canal_17_Banda": banda_2,
+            "max_corr": float(cross_corr_normalized[max_idx]),
+            "max_lag_ms": float(lags_ms[max_idx]),
+            "min_corr": float(cross_corr_normalized[min_idx]),
+            "min_lag_ms": float(lags_ms[min_idx]),
+            "mean_corr": float(np.mean(cross_corr_normalized)),
+            "std_corr": float(np.std(cross_corr_normalized)),
+        })
 
-    heatmap_data = df_resultados.pivot(index="CPF_canal", columns="Amy_canal", values="max_corr")
-    vmin, vmax = _escala_simetrica(heatmap_data.values)
+    df_resultados = pd.DataFrame(resultados)
+    df_resultados.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    plt.figure(figsize=(12, 8))
-    im = plt.imshow(heatmap_data.values, cmap="RdBu_r", aspect="auto", vmin=vmin, vmax=vmax)
-    plt.colorbar(im, label="Correlación Máxima")
-    for i in range(len(heatmap_data.index)):
-        for j in range(len(heatmap_data.columns)):
-            plt.text(j, i, f"{heatmap_data.values[i, j]:.3f}",
-                     ha="center", va="center", color="black", fontsize=8)
-    plt.xticks(range(len(heatmap_data.columns)), heatmap_data.columns)
-    plt.yticks(range(len(heatmap_data.index)), heatmap_data.index)
-    plt.title("Correlación Cruzada Máxima: CPF vs Amígdala", fontsize=14, fontweight="bold")
-    plt.xlabel("Canal Amígdala", fontsize=12)
-    plt.ylabel("Canal CPF", fontsize=12)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_heatmap_max.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    heatmap_lag = df_resultados.pivot(index="CPF_canal", columns="Amy_canal", values="max_lag_ms")
-    plt.figure(figsize=(12, 8))
-    im2 = plt.imshow(heatmap_lag.values, cmap="viridis", aspect="auto")
-    plt.colorbar(im2, label="Lag (ms)")
-    for i in range(len(heatmap_lag.index)):
-        for j in range(len(heatmap_lag.columns)):
-            plt.text(j, i, f"{heatmap_lag.values[i, j]:.1f}",
-                     ha="center", va="center", color="white", fontsize=8)
-    plt.xticks(range(len(heatmap_lag.columns)), heatmap_lag.columns)
-    plt.yticks(range(len(heatmap_lag.index)), heatmap_lag.index)
-    plt.title("Lag de Correlación Máxima (ms): CPF vs Amígdala", fontsize=14, fontweight="bold")
-    plt.xlabel("Canal Amígdala", fontsize=12)
-    plt.ylabel("Canal CPF", fontsize=12)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_heatmap_lag.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    etiquetas = [f"CPF{fila.CPF_canal}-Amy{fila.Amy_canal}" for fila in df_resultados.itertuples()]
-    plt.figure(figsize=(16, 6))
-    plt.bar(np.arange(len(df_resultados)), df_resultados["max_corr"], color="steelblue", alpha=0.7)
-    plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-    plt.xticks(np.arange(len(df_resultados)), etiquetas, rotation=90, fontsize=8)
-    plt.ylabel("Correlación Máxima", fontsize=12)
-    plt.title("Correlación Cruzada Máxima por Par de Canales", fontsize=14, fontweight="bold")
-    plt.grid(True, alpha=0.3, axis="y")
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_barras_max.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    plt.figure(figsize=(10, 6))
-    scatter = plt.scatter(df_resultados["max_lag_ms"], df_resultados["max_corr"],
-                          c=range(len(df_resultados)), cmap="viridis", s=50, alpha=0.7)
-    plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-    plt.axvline(x=0, color="black", linestyle="--", alpha=0.5)
-    plt.xlabel("Lag de Correlación Máxima (ms)", fontsize=12)
-    plt.ylabel("Correlación Máxima", fontsize=12)
-    plt.title("Relación entre Correlación y Lag", fontsize=14, fontweight="bold")
-    plt.colorbar(scatter, label="Índice de combinación")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_scatter.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    top_10 = df_resultados.nlargest(10, "max_corr")
-    plt.figure(figsize=(12, 6))
-    plt.bar(np.arange(len(top_10)), top_10["max_corr"], color="darkgreen", alpha=0.7)
-    plt.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-    plt.xticks(np.arange(len(top_10)),
-               [f"CPF{fila.CPF_canal}-Amy{fila.Amy_canal}" for fila in top_10.itertuples()],
-               rotation=45, ha="right", fontsize=10)
-    plt.ylabel("Correlación Máxima", fontsize=12)
-    plt.title("Top 10 Combinaciones con Mayor Correlación", fontsize=14, fontweight="bold")
-    plt.grid(True, alpha=0.3, axis="y")
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_top10.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    print()
-    print("Top 10 combinaciones con mayor correlación:")
-    print(top_10[["CPF_canal", "Amy_canal", "max_corr", "max_lag_ms"]].to_string(index=False))
+    print("=" * 80)
+    print("SEIS COMBINACIONES CANAL 1 vs CANAL 17")
+    print(df_resultados)
+    print(f"CSV de resumen guardado en: {output_csv}")
+    print("=" * 80)
 
     return df_resultados
-    print()
-    
-    for i, (canal_cpf, canal_amy) in enumerate(combinaciones, 1):
-        print(f"[{i}/{len(combinaciones)}] Analizando CPF-{canal_cpf} vs Amy-{canal_amy}")
-        
-        # Extraer señales desde matriz_eeg
-        col_cpf = original_to_col[canal_cpf]
-        col_amy = original_to_col[canal_amy]
-        senal_cpf = matriz_eeg[:, col_cpf]
-        senal_amy = matriz_eeg[:, col_amy]
-        
-        # Igualar longitudes
-        min_len = min(len(senal_cpf), len(senal_amy))
-        senal_cpf = senal_cpf[:min_len]
-        senal_amy = senal_amy[:min_len]
-        
-        # Calcular correlación cruzada
-        resultado = calcular_correlacion_cruzada(senal_cpf, senal_amy, Fs, max_lag_ms)
-        
-        # Guardar resultado
-        info_resultado = {
-            'CPF_canal': canal_cpf,
-            'Amy_canal': canal_amy,
-            'max_corr': resultado['max_corr'],
-            'max_lag_ms': resultado['max_lag'],
-            'min_corr': resultado['min_corr'],
-            'min_lag_ms': resultado['min_lag'],
-            'mean_corr': np.mean(resultado['cross_corr']),
-            'std_corr': np.std(resultado['cross_corr'])
-        }
-        resultados.append(info_resultado)
-        
-        # Guardar datos de correlación para visualización
-        key = f"CPF_{canal_cpf}_Amy_{canal_amy}"
-        datos_correlacion[key] = resultado
-        
-        print(f"  - Máx: {resultado['max_corr']:.4f} @ {resultado['max_lag']:.1f}ms")
-        print(f"  - Mín: {resultado['min_corr']:.4f} @ {resultado['min_lag']:.1f}ms")
-        print()
-    
-    # Crear DataFrame con resultados
-    df_resultados = pd.DataFrame(resultados)
-    
-    # Guardar resultados
-    print("Guardando resultados...")
-    df_resultados.to_csv("correlacion_cruzada_combinatoria_resumen.csv", index=False)
-    print("  - correlacion_cruzada_combinatoria_resumen.csv")
-    
-    # Guardar datos de correlación completos
-    np.save("correlacion_cruzada_combinatoria_datos.npy", datos_correlacion)
-    print("  - correlacion_cruzada_combinatoria_datos.npy")
-    
-    # Generar directorio para resultados individuales
-    directorio_individual = "correlaciones_individuales"
-    if not os.path.exists(directorio_individual):
-        os.makedirs(directorio_individual)
-        print(f"Directorio creado: {directorio_individual}")
-    
-    # Generar gráficos y CSVs individuales para cada combinación
-    print()
-    print("Generando gráficos y CSVs individuales...")
-    
-    for i, (canal_cpf, canal_amy) in enumerate(combinaciones, 1):
-        key = f"CPF_{canal_cpf}_Amy_{canal_amy}"
-        if key in datos_correlacion:
-            data = datos_correlacion[key]
-            
-            # Generar gráfico individual
-            plt.figure(figsize=(12, 5))
-            plt.plot(data['lags_ms'], data['cross_corr'], linewidth=2, color='blue')
-            plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-            plt.axvline(x=0, color='black', linestyle='--', alpha=0.5)
-            plt.axvline(x=data['max_lag'], color='red', linestyle=':', linewidth=2, 
-                       label=f'Máx: {data["max_corr"]:.3f} @ {data["max_lag"]:.1f}ms')
-            plt.axvline(x=data['min_lag'], color='green', linestyle=':', linewidth=2, 
-                       label=f'Mín: {data["min_corr"]:.3f} @ {data["min_lag"]:.1f}ms')
-            
-            plt.xlabel('Lag (ms)', fontsize=12)
-            plt.ylabel('Correlación Cruzada', fontsize=12)
-            plt.title(f'Correlación Cruzada: CPF-{canal_cpf} vs Amy-{canal_amy}', 
-                     fontsize=14, fontweight='bold')
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
-            
-            nombre_grafico = f"{directorio_individual}/correlacion_CPF{canal_cpf}_Amy{canal_amy}.png"
-            plt.savefig(nombre_grafico, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            # Generar CSV individual
-            df_individual = pd.DataFrame({
-                'lag_ms': data['lags_ms'],
-                'cross_correlation': data['cross_corr']
+
+
+def save_global_band_average_plots(curvas_promedio, output_dir, threshold=0.2):
+    """Save the global average-curves figures and their maxima table."""
+    colors = plt.cm.turbo(np.linspace(0, 1, len(curvas_promedio)))
+    maxima_rows = []
+
+    fig, ax = plt.subplots(figsize=(24, 24))
+    for index, (curva, color) in enumerate(zip(curvas_promedio, colors), start=1):
+        lags_ms = curva['lags_ms']
+        promedio = curva['correlacion_promedio']
+        ax.fill_between(lags_ms, curva['ic95_inferior'], curva['ic95_superior'], color=color, alpha=0.06)
+        ax.plot(
+            lags_ms,
+            promedio,
+            color=color,
+            linewidth=1.5,
+            label=f"CPF {curva['Banda_CPF']} vs Amy {curva['Banda_Amy']}",
+        )
+
+        max_idx = int(np.argmax(promedio))
+        max_corr = float(promedio[max_idx])
+        max_lag = float(lags_ms[max_idx])
+
+        # Determinar dirección del liderazgo para esta curva
+        direccion_texto = determinar_direccion_liderazgo(max_lag, "CPF", "Amy")
+
+        if max_corr > threshold:
+            identifier = f"M{len(maxima_rows) + 1:02d}"
+            maxima_rows.append({
+                'ID': identifier,
+                'Banda_CPF': curva['Banda_CPF'],
+                'Banda_Amy': curva['Banda_Amy'],
+                'Max_Cross_Correlation_Promedio': max_corr,
+                'Lag_del_Maximo_ms': max_lag,
+                'Direccion_Liderazgo': direccion_texto,
+                'Umbral': threshold,
+                'Pares_de_Canales_Incluidos': curva['n_pares_canales'],
             })
-            nombre_csv = f"{directorio_individual}/correlacion_CPF{canal_cpf}_Amy{canal_amy}.csv"
-            df_individual.to_csv(nombre_csv, index=False)
-            
-            if i % 10 == 0:
-                print(f"  Progreso: {i}/{len(combinaciones)} combinaciones procesadas")
-    
-    print(f"  Completado: {len(combinaciones)} gráficos y CSVs individuales generados")
-    
-    # Generar visualizaciones resumen
-    print()
-    print("Generando visualizaciones resumen...")
-    
-    # 1. Heatmap de correlaciones máximas
-    plt.figure(figsize=(12, 8))
-    heatmap_data = df_resultados.pivot(index='CPF_canal', columns='Amy_canal', values='max_corr')
-    
-    im = plt.imshow(heatmap_data.values, cmap='RdBu_r', aspect='auto', vmin=-1, vmax=1)
-    plt.colorbar(im, label='Correlación Máxima')
-    
-    for i in range(len(heatmap_data.index)):
-        for j in range(len(heatmap_data.columns)):
-            text = plt.text(j, i, f'{heatmap_data.values[i, j]:.3f}',
-                          ha="center", va="center", color="black", fontsize=8)
-    
-    plt.xticks(range(len(heatmap_data.columns)), heatmap_data.columns)
-    plt.yticks(range(len(heatmap_data.index)), heatmap_data.index)
-    plt.title('Correlación Cruzada Máxima: CPF vs Amígdala', fontsize=14, fontweight='bold')
-    plt.xlabel('Canal Amígdala', fontsize=12)
-    plt.ylabel('Canal CPF', fontsize=12)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_heatmap_max.png", dpi=300, bbox_inches='tight')
-    print("  - correlacion_cruzada_heatmap_max.png")
-    plt.close()
-    
-    # 2. Heatmap de lags de correlación máxima
-    plt.figure(figsize=(12, 8))
-    heatmap_lag = df_resultados.pivot(index='CPF_canal', columns='Amy_canal', values='max_lag_ms')
-    
-    im2 = plt.imshow(heatmap_lag.values, cmap='viridis', aspect='auto')
-    plt.colorbar(im2, label='Lag (ms)')
-    
-    for i in range(len(heatmap_lag.index)):
-        for j in range(len(heatmap_lag.columns)):
-            text = plt.text(j, i, f'{heatmap_lag.values[i, j]:.1f}',
-                          ha="center", va="center", color="white", fontsize=8)
-    
-    plt.xticks(range(len(heatmap_lag.columns)), heatmap_lag.columns)
-    plt.yticks(range(len(heatmap_lag.index)), heatmap_lag.index)
-    plt.title('Lag de Correlación Máxima (ms): CPF vs Amígdala', fontsize=14, fontweight='bold')
-    plt.xlabel('Canal Amígdala', fontsize=12)
-    plt.ylabel('Canal CPF', fontsize=12)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_heatmap_lag.png", dpi=300, bbox_inches='tight')
-    print("  - correlacion_cruzada_heatmap_lag.png")
-    plt.close()
-    
-    # 3. Gráfico de barras de correlaciones máximas
-    plt.figure(figsize=(16, 6))
-    x_positions = np.arange(len(df_resultados))
-    plt.bar(x_positions, df_resultados['max_corr'], color='steelblue', alpha=0.7)
-    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    
-    labels = [f"CPF{row['CPF_canal']}-Amy{row['Amy_canal']}" for _, row in df_resultados.iterrows()]
-    plt.xticks(x_positions, labels, rotation=90, fontsize=8)
-    
-    plt.ylabel('Correlación Máxima', fontsize=12)
-    plt.title('Correlación Cruzada Máxima por Par de Canales', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_barras_max.png", dpi=300, bbox_inches='tight')
-    print("  - correlacion_cruzada_barras_max.png")
-    plt.close()
-    
-    # 4. Scatter plot: correlación vs lag
-    plt.figure(figsize=(10, 6))
-    scatter = plt.scatter(df_resultados['max_lag_ms'], df_resultados['max_corr'], 
-                        c=range(len(df_resultados)), cmap='viridis', s=50, alpha=0.7)
-    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    plt.axvline(x=0, color='black', linestyle='--', alpha=0.5)
-    plt.xlabel('Lag de Correlación Máxima (ms)', fontsize=12)
-    plt.ylabel('Correlación Máxima', fontsize=12)
-    plt.title('Relación entre Correlación y Lag', fontsize=14, fontweight='bold')
-    plt.colorbar(scatter, label='Índice de combinación')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_scatter.png", dpi=300, bbox_inches='tight')
-    print("  - correlacion_cruzada_scatter.png")
-    plt.close()
-    
-    # 5. Top 10 combinaciones con mayor correlación
-    top_10 = df_resultados.nlargest(10, 'max_corr')
-    
-    plt.figure(figsize=(12, 6))
-    x_pos = np.arange(len(top_10))
-    plt.bar(x_pos, top_10['max_corr'], color='darkgreen', alpha=0.7)
-    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    
-    labels = [f"CPF{row['CPF_canal']}-Amy{row['Amy_canal']}" for _, row in top_10.iterrows()]
-    plt.xticks(x_pos, labels, rotation=45, ha='right', fontsize=10)
-    
-    plt.ylabel('Correlación Máxima', fontsize=12)
-    plt.title('Top 10 Combinaciones con Mayor Correlación', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig("correlacion_cruzada_top10.png", dpi=300, bbox_inches='tight')
-    print("  - correlacion_cruzada_top10.png")
-    plt.close()
-    
-    print()
+            ax.scatter(max_lag, max_corr, color='red', edgecolor='white', linewidth=0.8, s=70, zorder=4)
+            # Anotación con ID y dirección del liderazgo
+            ax.annotate(f"{identifier}\n{direccion_texto}", (max_lag, max_corr),
+                       xytext=(5, 8), textcoords='offset points',
+                       color='darkred', fontsize=8, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.6))
+
+    ax.axvline(0, color='gray', linestyle='--', linewidth=1)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=1)
+    ax.axhline(threshold, color='red', linestyle=':', linewidth=1)
+    ax.set_xlabel('Lag (ms)')
+    ax.set_ylabel('Cross-correlation de envolventes promedio')
+    ax.set_title(
+        f'{len(curvas_promedio)} curvas promedio con IC95% y maximos individuales > {threshold} '
+        f'(n={len(maxima_rows)}) - Intervalo {ANALYSIS_INTERVAL_LABEL}'
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.11), ncol=3, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'todas_las_curvas_promedio_bandas_IC95.png'), dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+    maxima = pd.DataFrame(maxima_rows)
+    maxima.to_csv(
+        os.path.join(output_dir, 'maximos_curvas_promedio_mayor_0p2.csv'),
+        index=False,
+        encoding='utf-8-sig',
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    if not maxima.empty:
+        ax.scatter(maxima['Lag_del_Maximo_ms'], maxima['Max_Cross_Correlation_Promedio'], color='red')
+        for row in maxima.itertuples(index=False):
+            ax.annotate(row.ID, (row.Lag_del_Maximo_ms, row.Max_Cross_Correlation_Promedio), xytext=(5, 5), textcoords='offset points')
+    ax.axvline(0, color='gray', linestyle='--', linewidth=1)
+    ax.axhline(threshold, color='red', linestyle=':', linewidth=1)
+    ax.set_xlabel('Lag del maximo (ms)')
+    ax.set_ylabel('Maxima cross-correlation promedio')
+    ax.set_title(f'Maximos de curvas promedio > {threshold} - Intervalo {ANALYSIS_INTERVAL_LABEL}')
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'maximos_curvas_promedio_mayor_0p2.png'), dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
+def correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col, combinaciones=None):
+    """Genera el flujo de 440 combinaciones desde el CSV del usuario y,
+    para cada fila, la curva real de cross-correlation envelopes siguiendo la
+    logica de la primera combinación de la foto.
+
+    Reglas:
+    1. cada canal recibe su propio filtro de banda según la fila del CSV
+       `(canal_cpf, canal_amy, low_cpf, high_cpf, low_amy, high_amy)`;
+    2. se normaliza cada señal filtrada;
+    3. se toma la envolvente usando Hilbert;
+    4. se normalizan las envolventes;
+    5. se calcula la correlación en lag usando el solapamiento de overlap;
+    6. el peak que grafica cada curva es el valor real del máximo de esa serie,
+       y no una escala empujada a 1.
+    """
     print("=" * 80)
-    print("ANÁLISIS COMPLETADO")
+    print("CORRELACIÓN CRUZADA COMBINATORIA: CPF (1-10) vs AMÍGDALA (17-25)")
     print("=" * 80)
     print()
-    print("Resumen estadístico:")
-    print(df_resultados.describe())
-    print()
-    print("Top 10 combinaciones con mayor correlación:")
-    print(top_10[['CPF_canal', 'Amy_canal', 'max_corr', 'max_lag_ms']].to_string(index=False))
-    print()
-    print("Archivos generados:")
-    print("  - correlacion_cruzada_combinatoria_resumen.csv (resumen general)")
-    print("  - correlacion_cruzada_combinatoria_datos.npy (datos completos)")
-    print("  - correlacion_cruzada_heatmap_max.png")
-    print("  - correlacion_cruzada_heatmap_lag.png")
-    print("  - correlacion_cruzada_barras_max.png")
-    print("  - correlacion_cruzada_scatter.png")
-    print("  - correlacion_cruzada_top10.png")
-    print(f"  - {len(combinaciones)} gráficos individuales en directorio 'correlaciones_individuales/'")
-    print(f"  - {len(combinaciones)} archivos CSV individuales en directorio 'correlaciones_individuales/'")
-    
+
+    output_dir = os.path.join(os.getcwd(), "todacombinacion_bandas")
+    os.makedirs(output_dir, exist_ok=True)
+
+    if combinaciones is None:
+        combinaciones = leer_combinaciones_excel(os.path.join(os.getcwd(), "EjemploCombinacion_CPF_vs_Amigdala_Todas.csv"))
+
+    if combinaciones is None:
+        print("No se encontraron combinaciones válidas en EjemploCombinacion_CPF_vs_Amigdala_Todas.csv")
+        return pd.DataFrame()
+
+    canales_cpf = list(range(1, 11))
+    canales_amy = list(range(17, 26))
+    pares_canales = list(product(canales_cpf, canales_amy))
+    canales_faltantes = [canal for canal in canales_cpf + canales_amy if canal not in original_to_col]
+    if canales_faltantes:
+        raise ValueError(f"Faltan canales para construir los 90 pares requeridos: {canales_faltantes}")
+
+    # El CSV puede asignar cada pareja de bandas solo a algunos canales.
+    # Para comparar los canales de forma balanceada, se usa cada pareja de bandas
+    # única como plantilla para los 90 pares CPF-Amy.
+    pares_bandas = list(dict.fromkeys(
+        (float(comb[2]), float(comb[3]), float(comb[4]), float(comb[5]))
+        for comb in combinaciones
+        if len(comb) == 6
+    ))
+    combinaciones = [
+        (canal_cpf, canal_amy, *par_bandas)
+        for par_bandas in pares_bandas
+        for canal_cpf, canal_amy in pares_canales
+    ]
+
+    # ESCRIBE LA TABLA CANONICA DE COMBINACIONES.
+    filas = []
+    for idx, comb in enumerate(combinaciones, start=1):
+        if len(comb) != 6:
+            continue
+        canal_cpf, canal_amy, low_cpf, high_cpf, low_amy, high_amy = comb
+        canal_cpf = int(canal_cpf)
+        canal_amy = int(canal_amy)
+        filas.append({
+            "Combinacion": idx,
+            "Canales": f"{canal_cpf}-{canal_amy}",
+            "Banda Canal 1": f"{float(low_cpf):g}-{float(high_cpf):g}Hz",
+            "Banda Canal 2": f"{float(low_amy):g}-{float(high_amy):g}Hz",
+        })
+
+    df_combinaciones = pd.DataFrame(filas)
+    salida_csv = os.path.join(output_dir, "combinaciones_totales.csv")
+    df_combinaciones.to_csv(salida_csv, index=False, encoding='utf-8-sig')
+
+    # GENERA UN GRÁFICO POR CADA PAR DE BANDAS, CON TODOS LOS PARES DE CANALES.
+    resultados = []
+    curvas_por_bandas = {}
+    n_muestras = matriz_eeg.shape[0]
+    fft_size = next_fast_len(2 * n_muestras - 1)
+    max_lag_samples = max(1, int(round(250 / 1000.0 * Fs)))
+    lags_samples = np.arange(-max_lag_samples, max_lag_samples + 1)
+    fft_lag_indices = np.where(lags_samples >= 0, lags_samples, fft_size + lags_samples)
+    lags_ms = lags_samples / Fs * 1000.0
+    overlaps = np.maximum(n_muestras - np.abs(lags_samples), 1)
+
+    def calcular_fft_envolvente(canal, lowcut, highcut):
+            signal = np.asarray(matriz_eeg[:, original_to_col[canal]], dtype=np.float64)
+            filtered = butterworth_bandpass(signal, Fs, lowcut, highcut, order=4)
+            normalized = normalizar_senal(filtered)
+            envelope = normalizar_senal(np.abs(hilbert(normalized)))
+            return rfft(envelope.astype(np.float32), n=fft_size)
+
+    total_combinaciones = len(pares_bandas) * len(pares_canales)
+    combinaciones_procesadas = 0
+    bandas_cpf = list(dict.fromkeys((pair[0], pair[1]) for pair in pares_bandas))
+    fft_cpf_cache = {}
+    for banda_idx, (low_cpf, high_cpf) in enumerate(bandas_cpf, start=1):
+        fft_cpf_cache[(low_cpf, high_cpf)] = np.stack([
+            calcular_fft_envolvente(canal, low_cpf, high_cpf)
+            for canal in canales_cpf
+        ])
+        print(f"Bandas CPF filtradas: {banda_idx}/{len(bandas_cpf)}")
+
+    pares_por_banda_amy = {}
+    for clave_bandas in pares_bandas:
+        pares_por_banda_amy.setdefault((clave_bandas[2], clave_bandas[3]), []).append(clave_bandas)
+
+    for banda_amy_idx, ((low_amy, high_amy), grupos_bandas) in enumerate(pares_por_banda_amy.items(), start=1):
+        fft_amy_cache = {
+            canal: calcular_fft_envolvente(canal, low_amy, high_amy)
+            for canal in canales_amy
+        }
+        fft_amy_batch = np.stack([fft_amy_cache[canal] for canal in canales_amy])
+
+        for clave_bandas in grupos_bandas:
+            low_cpf, high_cpf, _, _ = clave_bandas
+            fft_cpf_batch = fft_cpf_cache[(low_cpf, high_cpf)]
+            curvas_grupo = []
+
+            amy_batch_size = 3
+            for amy_batch_start in range(0, len(canales_amy), amy_batch_size):
+                amy_batch_channels = canales_amy[amy_batch_start:amy_batch_start + amy_batch_size]
+                fft_amy_chunk = fft_amy_batch[amy_batch_start:amy_batch_start + amy_batch_size]
+                correlations_fft = irfft(
+                    fft_cpf_batch[:, np.newaxis, :] * np.conj(fft_amy_chunk[np.newaxis, :, :]),
+                    n=fft_size,
+                    axis=-1,
+                    workers=-1,
+                )
+                correlation_batch = np.clip(
+                    np.nan_to_num(
+                        correlations_fft[:, :, fft_lag_indices] / overlaps,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ),
+                    -1.0,
+                    1.0,
+                )
+
+                for amy_idx, canal_amy in enumerate(amy_batch_channels):
+                    for canal_idx, canal_cpf in enumerate(canales_cpf):
+                        cross_corr_normalized = correlation_batch[canal_idx, amy_idx]
+                        max_idx = int(np.argmax(cross_corr_normalized))
+                        min_idx = int(np.argmin(cross_corr_normalized))
+                        peak_lag = float(lags_ms[max_idx])
+                        peak_corr = float(cross_corr_normalized[max_idx])
+                        min_lag = float(lags_ms[min_idx])
+                        min_corr = float(cross_corr_normalized[min_idx])
+                        combinaciones_procesadas += 1
+
+                        curva = {
+                            'Combinacion': combinaciones_procesadas,
+                            'Canal_CPF': canal_cpf,
+                            'Canal_Amy': canal_amy,
+                            'Banda_CPF': f"{low_cpf:g}-{high_cpf:g}Hz",
+                            'Banda_Amy': f"{low_amy:g}-{high_amy:g}Hz",
+                            'label': f"CPF {canal_cpf} vs Amy {canal_amy}",
+                            'lags_ms': lags_ms,
+                            'cross_corr_normalized': cross_corr_normalized.copy(),
+                            'peak_lag': peak_lag,
+                            'peak_corr': peak_corr,
+                            'min_lag': min_lag,
+                            'min_corr': min_corr,
+                        }
+                        curvas_grupo.append(curva)
+                        resultados.append({
+                            'Combinacion': combinaciones_procesadas,
+                            'CPF_canal': canal_cpf,
+                            'Amy_canal': canal_amy,
+                            'Banda_CPF': f"{low_cpf:g}-{high_cpf:g}Hz",
+                            'Banda_Amy': f"{low_amy:g}-{high_amy:g}Hz",
+                            'max_corr': peak_corr,
+                            'max_lag_ms': peak_lag,
+                            'min_corr': min_corr,
+                            'min_lag_ms': min_lag,
+                            'mean_corr': float(np.mean(cross_corr_normalized)),
+                            'std_corr': float(np.std(cross_corr_normalized)),
+                        })
+
+            curvas_por_bandas[clave_bandas] = curvas_grupo
+            print(
+                f"Parejas de bandas calculadas: {len(curvas_por_bandas)}/{len(pares_bandas)} "
+                f"({combinaciones_procesadas}/{total_combinaciones} correlaciones)"
+            )
+
+    # Cada gráfico muestra la media por lag de todos los pares de canales.
+    curvas_promedio_guardadas = []
+    for (low_cpf, high_cpf, low_amy, high_amy), curvas in sorted(curvas_por_bandas.items()):
+        lags_promedio = curvas[0]['lags_ms']
+        matriz_curvas = np.stack([
+            curva['cross_corr_normalized'] for curva in curvas
+        ], axis=0)
+        correlacion_promedio = np.mean(matriz_curvas, axis=0)
+        n_curvas = matriz_curvas.shape[0]
+        desviacion_estandar = np.std(matriz_curvas, axis=0, ddof=1)
+        margen_ic95 = t.ppf(0.975, n_curvas - 1) * desviacion_estandar / math.sqrt(n_curvas)
+        ic95_inferior = correlacion_promedio - margen_ic95
+        ic95_superior = correlacion_promedio + margen_ic95
+
+        curvas_promedio_guardadas.append({
+            'Banda_CPF': f"{low_cpf:g}-{high_cpf:g}Hz",
+            'Banda_Amy': f"{low_amy:g}-{high_amy:g}Hz",
+            'n_pares_canales': n_curvas,
+            'lags_ms': lags_promedio.copy(),
+            'correlacion_promedio': correlacion_promedio.copy(),
+            'ic95_inferior': ic95_inferior.copy(),
+            'ic95_superior': ic95_superior.copy(),
+        })
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.fill_between(
+            lags_promedio,
+            ic95_inferior,
+            ic95_superior,
+            color='tab:blue',
+            alpha=0.22,
+            label=f'IC95% ({n_curvas} pares)',
+        )
+        ax.plot(
+            lags_promedio,
+            correlacion_promedio,
+            color='tab:blue',
+            linewidth=2.2,
+            label=f'Promedio de {n_curvas} pares de canales',
+        )
+
+        ax.axvline(0, color='gray', linestyle='--', linewidth=0.8)
+        ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_xlabel('Lag (ms)')
+        ax.set_ylabel('Cross-correlation de envolventes')
+        ax.set_title(
+            f'CPF {low_cpf:g}-{high_cpf:g} Hz vs Amy {low_amy:g}-{high_amy:g} Hz '
+            f'- Intervalo {ANALYSIS_INTERVAL_LABEL}'
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best', frameon=True)
+
+        # Determinar y mostrar dirección del liderazgo
+        max_idx = int(np.argmax(correlacion_promedio))
+        max_lag = float(lags_promedio[max_idx])
+        direccion_texto = determinar_direccion_liderazgo(max_lag, "CPF", "Amy")
+
+        # Agregar texto en el gráfico
+        ax.text(0.02, 0.98, direccion_texto,
+                transform=ax.transAxes,
+                fontsize=11,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                fontweight='bold')
+
+        fig.tight_layout()
+        band_tag = (
+            f"cpf_{low_cpf:g}_{high_cpf:g}_amy_{low_amy:g}_{high_amy:g}"
+            .replace('.', 'p')
+        )
+        nombre_grafico = os.path.join(output_dir, f"grupo_bandas_{band_tag}.png")
+        fig.savefig(nombre_grafico, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+
+    df_resultados = pd.DataFrame(resultados)
+    df_resultados.to_csv(os.path.join(output_dir, "correlacion_cruzada_combinatoria_resumen.csv"), index=False, encoding='utf-8-sig')
+    np.save(
+        os.path.join(output_dir, "correlacion_cruzada_combinatoria_datos.npy"),
+        {"rows": resultados, "curvas_promedio": curvas_promedio_guardadas},
+    )
+    save_global_band_average_plots(curvas_promedio_guardadas, output_dir)
+
+    print(f"Parejas de bandas únicas: {len(pares_bandas)}")
+    print(f"Pares de canales por pareja de bandas: {len(pares_canales)}")
+    print(f"Se generaron {len(df_combinaciones)} combinaciones balanceadas en {salida_csv}")
+    print(f"Se generaron {len(curvas_por_bandas)} gráficos agrupados por bandas en {output_dir}")
+    print(f"En total se dibujaron {sum(len(v) for v in curvas_por_bandas.values())} curvas")
+    return df_resultados
+
+
+def correlacion_cruzada_combinatoria_cpf_amy_por_bandas(matriz_eeg, Fs, original_to_col, combinaciones=None, freq_bands=None):
+    """Calcula correlación cruzada de envolventes por banda y por par de canales.
+
+    Regla de compatibilidad:
+    - Si `combinaciones` es None, usa el patrón clásico de producto cartesiano con
+      la cuadrícula global de `freq_bands` (0-2, 1-3, ..., 28-30).
+    - Si `combinaciones` llega desde el parser del Excel, cada elemento ofrece
+      (canal_cpf, canal_amy, low_cpf, high_cpf, low_amy, high_amy) y se usa el
+      filtrado por canal separado de cada fila para cada canal.
+    """
+    print("=" * 80)
+    print("CORRELACION CRUZADA DE ENVOLVENTES POR BANDAS: CPF vs AMIGDALA")
+    print("=" * 80)
+
+    output_dir = os.path.join(os.getcwd(), "todacombinacion")
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_lag_ms = 250
+    if freq_bands is None:
+        freq_bands = [(float(low), float(low + 2)) for low in range(0, 29)]
+
+    canales_cpf = list(range(1, 11))
+    canales_amy = list(range(17, 26))
+
+    if combinaciones is None:
+        combinaciones = list(product(canales_cpf, canales_amy))
+        style = 'classic'
+    else:
+        # Si el Excel parser elaboró tuple de seis columnas, mantener per-channel filters.
+        # Si no, se trata de un producto cartesiano simple (two-element).
+        if all(isinstance(c, tuple) and len(c) == 6 for c in combinaciones):
+            style = 'excel'
+        else:
+            combinaciones = [(c[0], c[1]) for c in combinaciones]
+            style = 'classic'
+
+    canales_faltantes = [canal for canal in canales_cpf + canales_amy if canal not in original_to_col]
+    if canales_faltantes:
+        raise ValueError(f"Canales no disponibles: {canales_faltantes}")
+
+    resultados = []
+    datos_correlacion = {}
+
+    # Formato de salida por-bandas clásico: banda en ambos canales con el mismo intervalo.
+    if style == 'classic':
+        total = len(combinaciones) * len(freq_bands)
+        procesadas = 0
+        for canal_cpf, canal_amy in combinaciones:
+            senal_cpf = matriz_eeg[:, original_to_col[canal_cpf]]
+            senal_amy = matriz_eeg[:, original_to_col[canal_amy]]
+            min_len = min(len(senal_cpf), len(senal_amy))
+            senal_cpf = senal_cpf[:min_len]
+            senal_amy = senal_amy[:min_len]
+
+            for lowcut, highcut in freq_bands:
+                banda = f"Banda {lowcut:g}-{highcut:g} Hz"
+                resultado = calcular_correlacion_cruzada(
+                    senal_cpf,
+                    senal_amy,
+                    Fs,
+                    max_lag_ms=max_lag_ms,
+                    filtro=(lowcut, highcut),
+                    orden=4,
+                )
+                info_resultado = {
+                    "CPF_canal": canal_cpf,
+                    "Amy_canal": canal_amy,
+                    "Banda": banda,
+                    "Frecuencia_baja_Hz": lowcut,
+                    "Frecuencia_alta_Hz": highcut,
+                    "max_corr": resultado["max_corr"],
+                    "max_lag_ms": resultado["max_lag"],
+                    "min_corr": resultado["min_corr"],
+                    "min_lag_ms": resultado["min_lag"],
+                    "mean_corr": np.mean(resultado["cross_corr"]),
+                    "std_corr": np.std(resultado["cross_corr"]),
+                }
+                resultados.append(info_resultado)
+
+                key = f"CPF_{canal_cpf}_Amy_{canal_amy}_{lowcut:g}_{highcut:g}Hz"
+                datos_correlacion[key] = {
+                    "Banda": banda,
+                    "lowcut_hz": lowcut,
+                    "highcut_hz": highcut,
+                    **resultado,
+                }
+
+                df_individual = pd.DataFrame({
+                    "Banda": banda,
+                    "Frecuencia_baja_Hz": lowcut,
+                    "Frecuencia_alta_Hz": highcut,
+                    "lag_ms": resultado["lags_ms"],
+                    "cross_correlation_envelope": resultado["cross_corr"],
+                })
+                nombre_base = f"CPF{canal_cpf}_Amy{canal_amy}_{lowcut:g}_{highcut:g}Hz"
+                df_individual.to_csv(
+                    os.path.join(output_dir, f"correlacion_{nombre_base}.csv"),
+                    index=False,
+                    encoding="utf-8-sig",
+                )
+                procesadas += 1
+                if procesadas % 100 == 0 or procesadas == total:
+                    print(f"Procesadas {procesadas}/{total} correlaciones por banda")
+
+    else:
+        # Modo Excel: cada fila del parser define filtro del canal CPF y filtro del canal Amy.
+        total = len(combinaciones)
+        procesadas = 0
+        for canal_cpf, canal_amy, low_cpf, high_cpf, low_amy, high_amy in combinaciones:
+            senal_cpf = matriz_eeg[:, original_to_col[int(canal_cpf)]]
+            senal_amy = matriz_eeg[:, original_to_col[int(canal_amy)]]
+            min_len = min(len(senal_cpf), len(senal_amy))
+            senal_cpf = senal_cpf[:min_len]
+            senal_amy = senal_amy[:min_len]
+
+            banda_cpf = f"Banda {low_cpf:g}-{high_cpf:g} Hz"
+            banda_amy = f"Banda {low_amy:g}-{high_amy:g} Hz"
+            banda = f"{banda_cpf} // {banda_amy}"
+            resultado = calcular_correlacion_cruzada(
+                senal_cpf,
+                senal_amy,
+                Fs,
+                max_lag_ms=max_lag_ms,
+                filtro=None,
+                filtro_1=(low_cpf, high_cpf),
+                filtro_2=(low_amy, high_amy),
+                orden=4,
+            )
+
+            info_resultado = {
+                "CPF_canal": int(canal_cpf),
+                "Amy_canal": int(canal_amy),
+                "Banda": banda,
+                "Frecuencia_baja_Hz": low_cpf,
+                "Frecuencia_alta_Hz": high_cpf,
+                "Frecuencia_baja_Amy_Hz": low_amy,
+                "Frecuencia_alta_Amy_Hz": high_amy,
+                "max_corr": resultado["max_corr"],
+                "max_lag_ms": resultado["max_lag"],
+                "min_corr": resultado["min_corr"],
+                "min_lag_ms": resultado["min_lag"],
+                "mean_corr": np.mean(resultado["cross_corr"]),
+                "std_corr": np.std(resultado["cross_corr"]),
+            }
+            resultados.append(info_resultado)
+
+            key = f"CPF_{canal_cpf}_Amy_{canal_amy}_{low_cpf:g}_{high_cpf:g}Hz_{low_amy:g}_{high_amy:g}Hz"
+            datos_correlacion[key] = {
+                "Banda": banda,
+                "lowcut_cpf_hz": low_cpf,
+                "highcut_cpf_hz": high_cpf,
+                "lowcut_amy_hz": low_amy,
+                "highcut_amy_hz": high_amy,
+                **resultado,
+            }
+
+            df_individual = pd.DataFrame({
+                "Banda": banda,
+                "Frecuencia_baja_Hz": low_cpf,
+                "Frecuencia_alta_Hz": high_cpf,
+                "Frecuencia_baja_Amy_Hz": low_amy,
+                "Frecuencia_alta_Amy_Hz": high_amy,
+                "lag_ms": resultado["lags_ms"],
+                "cross_correlation_envelope": resultado["cross_corr"],
+            })
+            nombre_base = f"CPF{canal_cpf}_Amy{canal_amy}_{low_cpf:g}_{high_cpf:g}Hz_{low_amy:g}_{high_amy:g}Hz"
+            df_individual.to_csv(os.path.join(output_dir, f"correlacion_{nombre_base}.csv"), index=False, encoding='utf-8-sig')
+
+            procesadas += 1
+            print(f"Procesadas {procesadas}/{total} correlaciones por banda")
+
+    df_resultados = pd.DataFrame(resultados)
+    if not df_resultados.empty:
+        df_resultados.to_csv(os.path.join(output_dir, "correlacion_cruzada_combinatoria_por_banda_resumen.csv"), index=False, encoding='utf-8-sig')
+        np.save(os.path.join(output_dir, "correlacion_cruzada_combinatoria_por_banda_datos.npy"), datos_correlacion)
+
+    # Heatmaps y mapas del resumen global que usan una sola ventana por fila
+    if style == 'classic' and not df_resultados.empty:
+        # Generar un mapa de maximo y otro de lag para cada banda.
+        for banda, grupo in df_resultados.groupby("Banda", sort=False):
+            lowcut = grupo["Frecuencia_baja_Hz"].iloc[0]
+            highcut = grupo["Frecuencia_alta_Hz"].iloc[0]
+            max_matrix = grupo.pivot(index="CPF_canal", columns="Amy_canal", values="max_corr")
+            lag_matrix = grupo.pivot(index="CPF_canal", columns="Amy_canal", values="max_lag_ms")
+            band_tag = f"{lowcut:g}_{highcut:g}Hz"
+
+            for matrix, color_map, color_label, suffix in [
+                (max_matrix, "RdBu_r", "Correlacion maxima", "max"),
+                (lag_matrix, "viridis", "Lag del maximo (ms)", "lag"),
+            ]:
+                plt.figure(figsize=(10, 7))
+                image = plt.imshow(matrix.values, cmap=color_map, aspect="auto")
+                plt.colorbar(image, label=color_label)
+                plt.xticks(np.arange(len(matrix.columns)), matrix.columns)
+                plt.yticks(np.arange(len(matrix.index)), matrix.index)
+                plt.xlabel("Canal Amy")
+                plt.ylabel("Canal CPF")
+                plt.title(f"Correlacion cruzada de envolventes - {banda}")
+                for row_idx in range(matrix.shape[0]):
+                    for col_idx in range(matrix.shape[1]):
+                        value = matrix.iloc[row_idx, col_idx]
+                        if pd.notna(value):
+                            label = f"{value:.3f}" if suffix == "max" else f"{value:.1f}"
+                            plt.text(col_idx, row_idx, label, ha="center", va="center", color="black", fontsize=8)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"correlacion_cruzada_por_banda_{band_tag}_{suffix}.png"), dpi=300, bbox_inches='tight')
+                plt.close()
+
+    print("Resultados guardados:")
+    print(f"  - {os.path.join(output_dir, 'correlacion_cruzada_combinatoria_por_banda_resumen.csv')}")
+    print(f"  - {os.path.join(output_dir, 'correlacion_cruzada_combinatoria_por_banda_datos.npy')}")
+    print(f"  - {total} CSV individuales en {output_dir}/")
+    print(f"  - {len(freq_bands)} pares de mapas por banda (maximo y lag) en {output_dir}/")
     return df_resultados
 
 
 # ==============================================================================
-# 7. PUNTO DE ENTRADA (INDISPENSABLE PARA MULTIPROCESSING EN WINDOWS)
+# 6. PUNTO DE ENTRADA (INDISPENSABLE PARA MULTIPROCESSING EN WINDOWS)
 # ==============================================================================
 if __name__ == '__main__':
     import sys
-
-    def prompt_target_fs(prompt_text="Ingrese la frecuencia de muestreo deseada para el subsampleo (por ejemplo 1000), o Enter para usar la original: "):
-        try:
-            user_target = input(prompt_text).strip()
-            if not user_target:
-                return None
-            return int(user_target)
-        except ValueError:
-            print("Valor inválido para la frecuencia de muestreo. Se usará la frecuencia original.")
-            return None
     
     # Verificar argumentos de línea de comandos
     if len(sys.argv) > 1:
         mode = sys.argv[1].lower()
-        if mode in {'main', 'principal'}:
-            print("=== EJECUTANDO ANÁLISIS PRINCIPAL ORIGINAL ===")
-            main()
-        elif mode == 'cross' or mode == 'correlacion' or mode == 'combinatoria':
+        if mode == 'cross' or mode == 'correlacion' or mode == 'combinatoria':
             print("=== EJECUTANDO CORRELACIÓN CRUZADA COMBINATORIA CPF vs AMÍGDALA ===")
             try:
-                target_fs = prompt_target_fs()
-                matriz_eeg, Fs, original_to_col = load_cross_correlation_source(target_fs)
+                matriz_eeg, Fs, config = detect_data_source(target_fs=None)
+                matriz_eeg = select_analysis_interval(matriz_eeg, Fs)
+                # Crear mapeo de canales
+                n_canales = matriz_eeg.shape[1]
+                original_to_col = {i+1: i for i in range(n_canales)}
                 correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col)
             except Exception as e:
                 print(f"Error: {e}")
                 import traceback
                 traceback.print_exc()
+        elif mode == 'main':
+            main()
         else:
             print("=== EJECUTANDO ANÁLISIS PRINCIPAL ORIGINAL ===")
-            main()
+            save_lagged_mrl_5min_three_random_comparison(
+                "allChan_phase_instantanea.mat",
+                "resultado_mrl.mat",
+                500,
+                "Real",
+                660,
+                960
+            )
     else:
         # Sin argumentos: ejecutar correlación cruzada combinatoria por defecto
         print("=== EJECUTANDO CORRELACIÓN CRUZADA COMBINATORIA CPF vs AMÍGDALA (POR DEFECTO) ===")
         print("Para ejecutar análisis MRL original, usa: python leer_mat3.py main")
         print()
         try:
-            target_fs = prompt_target_fs()
-            matriz_eeg, Fs, original_to_col = load_cross_correlation_source(target_fs)
+            matriz_eeg, Fs, config = detect_data_source(target_fs=None)
+            matriz_eeg = select_analysis_interval(matriz_eeg, Fs)
+            # Crear mapeo de canales
+            n_canales = matriz_eeg.shape[1]
+            original_to_col = {i+1: i for i in range(n_canales)}
             correlacion_cruzada_combinatoria_cpf_amy(matriz_eeg, Fs, original_to_col)
         except Exception as e:
             print(f"Error: {e}")
